@@ -6,6 +6,9 @@ from typing import Dict, List, Optional, Union, Tuple, TYPE_CHECKING
 from prodsys.simulation import sim
 from prodsys.simulation import process, state
 from prodsys.util.util import get_class_from_str
+from prodsys.plugins.manager import PluginManager, HOOK_TYPE_STATE_CREATION
+from prodsys.plugins.hooks import StateCreationHook
+from prodsys.simulation.state import State # Ensure State is imported for type hinting
 
 
 from prodsys.models.resource_data import (
@@ -42,10 +45,23 @@ def register_states(
     resource: resources.Resource,
     states: List[state.STATE_UNION],
     _env: sim.Environment,
+    plugin_manager: PluginManager,
 ):
     for actual_state in states:
-        copy_state = copy.deepcopy(actual_state)
-        copy_state.env = _env
+        custom_state_instance = None
+        for hook_instance in plugin_manager.get_hooks(HOOK_TYPE_STATE_CREATION):
+            if isinstance(hook_instance, StateCreationHook):
+                custom_state_instance = hook_instance.on_state_create(resource, actual_state)
+                if custom_state_instance:
+                    break 
+        
+        if custom_state_instance:
+            copy_state = custom_state_instance 
+            if not hasattr(copy_state, 'env') or not copy_state.env:
+                 copy_state.env = _env
+        else:
+            copy_state = copy.deepcopy(actual_state)
+            copy_state.env = _env
         resource.add_state(copy_state)
 
 
@@ -53,20 +69,33 @@ def register_production_states(
     resource: resources.Resource,
     states: List[state.ProductionState],
     _env: sim.Environment,
+    plugin_manager: PluginManager,
 ):
     for actual_state, process_capacity in zip(states, resource.data.process_capacities):
+        custom_state_instance = None
+        for hook_instance in plugin_manager.get_hooks(HOOK_TYPE_STATE_CREATION):
+            if isinstance(hook_instance, StateCreationHook):
+                custom_state_instance = hook_instance.on_state_create(resource, actual_state) 
+                if custom_state_instance:
+                    break
         for _ in range(process_capacity):
-            copy_state = copy.deepcopy(actual_state)
-            copy_state.env = _env
+            if custom_state_instance:
+                copy_state = copy.deepcopy(custom_state_instance)
+                if not hasattr(copy_state, 'env') or not copy_state.env:
+                     copy_state.env = _env
+            else:
+                copy_state = copy.deepcopy(actual_state)
+                copy_state.env = _env
             resource.add_production_state(copy_state)
 
 
 def register_production_states_for_processes(
     resource: resources.Resource,
-    state_factory: state_factory.StateFactory,
+    state_factory_instance: state_factory.StateFactory, # Renamed parameter
     _env: sim.Environment,
+    plugin_manager: PluginManager, # Added parameter
 ):
-    states: List[state.State] = []
+    states: List[State] = [] # Changed to State
     for process_instance, capacity in zip(
         resource.processes, resource.data.process_capacities
     ):
@@ -78,13 +107,13 @@ def register_production_states_for_processes(
                 "time_model_id": process_instance.data.time_model_id,
             }
         }
-        existence_condition = process_instance.data.ID in state_factory.states
+        existence_condition = process_instance.data.ID in state_factory_instance.states
         if (
             isinstance(process_instance, process.ProductionProcess)
             or isinstance(process_instance, process.CapabilityProcess)
             or isinstance(process_instance, process.ReworkProcess)
         ) and not existence_condition:
-            state_factory.create_states_from_configuration_data(
+            state_factory_instance.create_states_from_configuration_data(
                 {"ProductionState": state_data_dict}
             )
         elif (
@@ -102,12 +131,12 @@ def register_production_states_for_processes(
                 state_data_dict["new_state"][
                     "unloading_time_model_id"
                 ] = process_instance.data.unloading_time_model_id
-            state_factory.create_states_from_configuration_data(
+            state_factory_instance.create_states_from_configuration_data(
                 {"TransportState": state_data_dict}
             )
-        _state = state_factory.get_states(IDs=[process_instance.data.ID]).pop()
+        _state = state_factory_instance.get_states(IDs=[process_instance.data.ID]).pop()
         states.append(_state)
-    register_production_states(resource, states, _env)  # type: ignore
+    register_production_states(resource, states, _env, plugin_manager) # type: ignore
 
 
 def adjust_process_breakdown_states(
@@ -153,6 +182,7 @@ class ResourceFactory:
         self.process_factory = process_factory
         self.state_factory = state_factory
         self.queue_factory = queue_factory
+        self.plugin_manager = PluginManager()
         self.all_resources: Dict[str, resources.Resource] = {}
         self.resources_can_move: Dict[str, resources.Resource] = {}
         self.resources_can_process: Dict[str, resources.Resource] = {}
@@ -220,13 +250,14 @@ class ResourceFactory:
         if "batch_size" in resource_data:
             values.update({"batch_size": resource_data.batch_size})
 
+        values["plugin_manager"] = self.plugin_manager
         resource_object = resources.Resource(**values)
         controller.set_resource(resource_object)
 
         states = self.state_factory.get_states(resource_data.state_ids)
-        register_states(resource_object, states, self.env)
+        register_states(resource_object, states, self.env, self.plugin_manager)
         register_production_states_for_processes(
-            resource_object, self.state_factory, self.env
+            resource_object, self.state_factory, self.env, self.plugin_manager
         )
         adjust_process_breakdown_states(resource_object, self.state_factory, self.env)
         self.all_resources[resource_object.data.ID] = resource_object

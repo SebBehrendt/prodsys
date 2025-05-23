@@ -11,6 +11,8 @@ import logging
 from prodsys.models.processes_data import ProcessTypeEnum
 from prodsys.simulation.request import RequestType
 
+from prodsys.plugins.manager import PluginManager, HOOK_TYPE_CONTROL_LOGIC, HOOK_TYPE_PROCESS_LOGIC
+from prodsys.plugins.hooks import ControlLogicHook, ProcessExecutionHook
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +84,7 @@ class Controller:
         self.resource: resources.Resource = None
         self.num_running_processes = 0
         self.reserved_requests_count = 0
+        self.plugin_manager = PluginManager()
 
     def set_resource(self, resource: resources.Resource) -> None:
         self.resource = resource
@@ -97,6 +100,11 @@ class Controller:
         self.requests.append(process_request)
         if not self.state_changed.triggered:
             self.state_changed.succeed()
+        
+        # Apply after_request_assignment hooks
+        for hook_instance in self.plugin_manager.get_hooks(HOOK_TYPE_CONTROL_LOGIC):
+            if isinstance(hook_instance, ControlLogicHook):
+                hook_instance.after_request_assignment(self, process_request)
 
     def control_loop(self) -> Generator:
         """
@@ -104,6 +112,11 @@ class Controller:
         It should repeatedly check if requests are made or a process is finished and then start the next process.
         """
         while True:
+            # Apply before_control_loop_iteration hooks
+            for hook_instance in self.plugin_manager.get_hooks(HOOK_TYPE_CONTROL_LOGIC):
+                if isinstance(hook_instance, ControlLogicHook):
+                    hook_instance.before_control_loop_iteration(self)
+            
             if self.resource.requires_charging:
                 # TODO: transport AGV to charging station
                 yield self.env.process(self.resource.charge())
@@ -253,7 +266,7 @@ class ProductionProcessHandler:
                 process
             )
             production_state.reserved = True
-            yield from self.run_process(production_state, product, process)
+            yield from self.run_process(production_state, product, process, process_request) # Pass process_request
             production_state.process = None
 
             yield from self.put_product_to_output_queue(target_queue, product)
@@ -266,6 +279,7 @@ class ProductionProcessHandler:
         input_state: state.State,
         target_product: product.Product,
         process: process.Process,
+        process_request: request_module.Request, # Added process_request
     ):
         """
         Run the process of a product. The process is started and the product is logged.
@@ -274,14 +288,34 @@ class ProductionProcessHandler:
             input_state (state.State): The production state of the process.
             target_product (product.Product): The product that is processed.
         """
-        input_state.state_info.log_product(
-            target_product, state.StateTypeEnum.production
-        )
-        input_state.process = self.env.process(input_state.process_state())
-        input_state.reserved = False
-        self.handle_rework_required(target_product, process)
+        plugin_mgr = self.resource.plugin_manager # Get PluginManager from resource
+        # request_obj = process_request # process_request is directly available
 
-        yield input_state.process
+        for hook in plugin_mgr.get_hooks(HOOK_TYPE_PROCESS_LOGIC):
+            if isinstance(hook, ProcessExecutionHook):
+                hook.before_process_start(process, self.resource, process_request)
+                
+        try:
+            input_state.state_info.log_product(
+                target_product, state.StateTypeEnum.production
+            )
+            # Store the SimPy process
+            simpy_process_event = self.env.process(input_state.process_state())
+            input_state.process = simpy_process_event # Assign to state as before
+            input_state.reserved = False
+            
+            yield simpy_process_event # Wait for the SimPy process to complete
+
+            self.handle_rework_required(target_product, process) # Original logic after process
+
+            for hook in plugin_mgr.get_hooks(HOOK_TYPE_PROCESS_LOGIC):
+                if isinstance(hook, ProcessExecutionHook):
+                    hook.after_process_finish(process, self.resource, process_request)
+        except Exception as e:
+            for hook in plugin_mgr.get_hooks(HOOK_TYPE_PROCESS_LOGIC):
+                if isinstance(hook, ProcessExecutionHook):
+                    hook.on_process_failure(process, self.resource, process_request, e)
+            raise # Re-raise the exception to not alter original behavior
 
     def handle_rework_required(
         self, product: product.Product, process: process.Process
@@ -411,7 +445,7 @@ class TransportProcessHandler:
                 )
                 transport_state.reserved = True
                 yield from self.run_transport(
-                    transport_state, product, route_to_origin, empty_transport=True
+                    transport_state, product, route_to_origin, empty_transport=True, process_request=process_request
                 )
                 transport_state.process = None
 
@@ -423,7 +457,7 @@ class TransportProcessHandler:
             )
             transport_state.reserved = True
             yield from self.run_transport(
-                transport_state, product, route_to_target, empty_transport=False
+                transport_state, product, route_to_target, empty_transport=False, process_request=process_request
             )
             transport_state.process = None
 
@@ -439,6 +473,7 @@ class TransportProcessHandler:
         item: Union[product.Product, primitive.Primitive],
         route: List[product.Locatable],
         empty_transport: bool,
+        process_request: request_module.Request,
     ) -> Generator:
         """
         Run the transport process and every single transport step in the route of the transport process.
@@ -469,6 +504,7 @@ class TransportProcessHandler:
                     empty_transport=empty_transport,
                     initial_transport_step=initial_transport_step,
                     last_transport_step=last_transport_step,
+                    process_request=process_request,
                 )
             )
             transport_state.reserved = False
@@ -506,6 +542,7 @@ class TransportProcessHandler:
         empty_transport: bool,
         initial_transport_step: bool,
         last_transport_step: bool,
+        process_request: request_module.Request,
     ):
         """
         Run the process of a product. The process is started and the product is logged.
@@ -518,6 +555,8 @@ class TransportProcessHandler:
             initial_transport_step (bool): If this is the initial transport step.
             last_transport_step (bool): If this is the last transport step.
         """
+        # This method will be further modified in a subsequent subtask to integrate hook logic.
+        # For this subtask, we are only ensuring process_request is correctly passed and available.
         if not hasattr(item, "product_info"):
             input_state.state_info.log_auxiliary(item, state.StateTypeEnum.transport)
         else:
@@ -533,11 +572,15 @@ class TransportProcessHandler:
         target_location = self.get_target_location(
             target, empty_transport, last_transport_step=last_transport_step
         )
-        input_state.process = self.env.process(
-            input_state.process_state(target=target_location, empty_transport=empty_transport, initial_transport_step=initial_transport_step, last_transport_step=last_transport_step)  # type: ignore False
+        
+        simpy_process_event = self.env.process(
+            input_state.process_state(target=target_location, empty_transport=empty_transport, initial_transport_step=initial_transport_step, last_transport_step=last_transport_step)
         )
-        yield input_state.process
+        input_state.process = simpy_process_event
+        
+        yield simpy_process_event
         self.update_location(target, location=target_location)
+
 
     def find_route_to_origin(
         self, process_request: request_module.Request
@@ -734,7 +777,7 @@ class DependencyProcessHandler:
         #     input_state.state_info.log_product(product, state.StateTypeEnum.transport)
 
         origin = self.resource.current_locatable
-        input_state.state_info.log_transport(
+        input_state.state_info.log_transport( # This logging is now inside the try block in the REPLACE section
             origin,
             target,
             state.StateTypeEnum.transport,
@@ -1019,6 +1062,12 @@ class BatchController(Controller):
             Generator: The generator yields when a request is made or a process is finished.
         """
         while True:
+            # Apply before_control_loop_iteration hooks
+            # self.plugin_manager should be inherited from Controller
+            for hook_instance in self.plugin_manager.get_hooks(HOOK_TYPE_CONTROL_LOGIC):
+                if isinstance(hook_instance, ControlLogicHook):
+                    hook_instance.before_control_loop_iteration(self)
+            
             batch_size = self.get_batch_size(self.resource)
             yield events.AnyOf(
                 env=self.env, events=self.running_processes + [self.state_changed]

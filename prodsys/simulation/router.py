@@ -23,6 +23,8 @@ from prodsys.factories import primitive_factory
 from prodsys.models.dependency_data import DependencyType
 from prodsys.simulation.process_matcher import ProcessMatcher
 from prodsys.simulation.request_handler import RequestHandler
+from prodsys.plugins.manager import PluginManager, HOOK_TYPE_ROUTING
+from prodsys.plugins.hooks import RoutingHook
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +134,7 @@ class Router:
 
         # Initialize the request handler
         self.request_handler = RequestHandler(process_matcher)
+        self.plugin_manager = PluginManager()
 
         # Initialize compatibility tables
 
@@ -168,11 +171,17 @@ class Router:
             while True:
                 # if not free_resources:
                 #     break
-                free_requests = self.request_handler.get_next_resource_request_to_route(
-                    free_resources
-                )
-                if not free_requests:
+                # Apply before_routing hooks
+                raw_free_requests = self.request_handler.get_next_resource_request_to_route(free_resources)
+                processed_free_requests = raw_free_requests
+                for hook_instance in self.plugin_manager.get_hooks(HOOK_TYPE_ROUTING):
+                    if isinstance(hook_instance, RoutingHook):
+                        processed_free_requests = hook_instance.before_routing(self, list(processed_free_requests)) # Pass a copy
+                free_requests = processed_free_requests
+                
+                if not free_requests: # Add this check as hooks might empty the list
                     break
+                
                 self.env.update_progress_bar()
                 request: request.Request = self.route_request(free_requests)
                 self.request_handler.mark_routing(request)
@@ -261,6 +270,34 @@ class Router:
         Returns:
             request.Request: The allocated request.
         """
+        # Apply decide_route hooks
+        for hook_instance in self.plugin_manager.get_hooks(HOOK_TYPE_ROUTING):
+            if isinstance(hook_instance, RoutingHook): # Ensure it's the correct hook type
+                chosen_request = hook_instance.decide_route(self, free_requests)
+                if chosen_request:
+                    # If a hook made a decision, we need to ensure it's removed from free_requests
+                    # and then directly use it.
+                    if chosen_request in free_requests:
+                        free_requests.remove(chosen_request) 
+                    
+                    # Standard queue assignment logic from original method:
+                    if chosen_request.request_type == request.RequestType.TRANSPORT:
+                        origin_queue = chosen_request.origin.output_queues[0]
+                        target_queue = chosen_request.target.input_queues[0]
+                    elif chosen_request.request_type == request.RequestType.PRODUCTION:
+                        origin_queue = chosen_request.resource.input_queues[0]
+                        target_queue = chosen_request.resource.output_queues[0]
+                    elif chosen_request.request_type in (
+                        request.RequestType.PRIMITIVE_DEPENDENCY,
+                        request.RequestType.PROCESS_DEPENDENCY,
+                        request.RequestType.RESOURCE_DEPENDENCY,
+                    ):
+                        origin_queue = None
+                        target_queue = None
+                    chosen_request.origin_queue = origin_queue
+                    chosen_request.target_queue = target_queue
+                    return chosen_request # Return the hook's choice
+
         # Determine based on the routing heuristic
         try:
             routing_heuristic = free_requests[0].requesting_item.routing_heuristic

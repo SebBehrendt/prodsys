@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 from simpy.resources import resource
 from simpy import events
 
+from prodsys.plugins.manager import PluginManager
+
 if TYPE_CHECKING:
     from prodsys.simulation import control, state
     from prodsys.simulation.dependency import DependedEntity, Dependency
@@ -120,6 +122,7 @@ class Resource(resource.Resource):
         data: ResourceData,
         processes: List[PROCESS_UNION],
         controller: control.Controller,
+        plugin_manager: PluginManager, # Added
         can_move: bool = False,
         can_process: bool = False,
         states: List[state.State] = None,
@@ -135,6 +138,7 @@ class Resource(resource.Resource):
         self.data = data
         self.processes = processes
         self.controller = controller
+        self.plugin_manager = plugin_manager # Added
         self.states = states if states else []
         self.production_states = production_states if production_states else []
         self.setup_states = setup_states if setup_states else []
